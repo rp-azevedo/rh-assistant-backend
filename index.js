@@ -29,14 +29,69 @@ async function readBody(req) {
   });
 }
 
+function httpsRequest(options, body) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error('Resposta inválida: ' + data.substring(0, 200))); }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function searchNotion(query) {
+  const body = JSON.stringify({ query, page_size: 5 });
+  const res = await httpsRequest({
+    hostname: 'api.notion.com',
+    path: '/v1/search',
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${NOTION_TOKEN}`,
+      'Notion-Version': '2022-06-28',
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    }
+  }, body);
+  return res.results || [];
+}
+
+async function getPageContent(pageId) {
+  const res = await httpsRequest({
+    hostname: 'api.notion.com',
+    path: `/v1/blocks/${pageId}/children?page_size=100`,
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${NOTION_TOKEN}`,
+      'Notion-Version': '2022-06-28'
+    }
+  });
+  return (res.results || []).map(block => {
+    const type = block.type;
+    const rich = block[type]?.rich_text || [];
+    return rich.map(r => r.plain_text).join('');
+  }).filter(Boolean).join('\n');
+}
+
+function getPageTitle(page) {
+  const props = page.properties || {};
+  for (const key in props) {
+    if (props[key].type === 'title') {
+      return props[key].title.map(t => t.plain_text).join('');
+    }
+  }
+  return 'Sem título';
+}
+
 const server = http.createServer(async (req, res) => {
   setCORS(res);
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   if (req.method === 'GET' && req.url === '/health') {
     return sendJSON(res, 200, { ok: true });
@@ -59,20 +114,32 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
+      const lastMessage = body.messages[body.messages.length - 1].content;
+
+      const searchResults = await searchNotion(lastMessage);
+      let context = '';
+      for (const page of searchResults.slice(0, 3)) {
+        if (page.object !== 'page') continue;
+        const title = getPageTitle(page);
+        try {
+          const content = await getPageContent(page.id);
+          context += `\n\n=== ${title} ===\n${content}`;
+        } catch (e) {}
+      }
+
       const payload = JSON.stringify({
         model: 'claude-sonnet-4-5',
         max_tokens: 1000,
-        system: `Você é um assistente de RH da empresa. O colaborador logado é: ${user.name}. Responda dúvidas sobre regras, direitos, deveres, benefícios e informações institucionais com base no wiki da empresa no Notion (conectado via MCP). Seja simpático, claro e objetivo. Use linguagem informal mas profissional. Se não encontrar a informação no Notion, diga que vai verificar e sugira contato com o RH. Responda sempre em português brasileiro.`,
-        messages: body.messages,
-        mcp_servers: [{
-          type: 'url',
-          url: 'https://mcp.notion.com/mcp',
-          name: 'notion-mcp',
-          authorization_token: process.env.NOTION_TOKEN
-        }]
+        system: `Você é um assistente de RH da empresa. O colaborador logado é: ${user.name}.
+
+Responda dúvidas usando APENAS as informações do wiki abaixo. Seja simpático, claro e objetivo. Use linguagem informal mas profissional. Se a informação não estiver no wiki, diga que vai verificar e sugira contato com o RH. Responda sempre em português brasileiro.
+
+WIKI DA EMPRESA:
+${context || '(nenhuma informação encontrada para essa pergunta)'}`,
+        messages: body.messages
       });
 
-      const options = {
+      const data = await httpsRequest({
         hostname: 'api.anthropic.com',
         path: '/v1/messages',
         method: 'POST',
@@ -80,25 +147,9 @@ const server = http.createServer(async (req, res) => {
           'Content-Type': 'application/json',
           'x-api-key': ANTHROPIC_API_KEY,
           'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'mcp-client-2025-04-04',
           'Content-Length': Buffer.byteLength(payload)
         }
-      };
-
-      const apiRes = await new Promise((resolve, reject) => {
-        const apiReq = https.request(options, resolve);
-        apiReq.on('error', reject);
-        apiReq.write(payload);
-        apiReq.end();
-      });
-
-      let rawData = '';
-      await new Promise((resolve) => {
-        apiRes.on('data', chunk => rawData += chunk);
-        apiRes.on('end', resolve);
-      });
-
-      const data = JSON.parse(rawData);
+      }, payload);
 
       if (data.error) {
         console.error('API error:', JSON.stringify(data.error));
@@ -108,8 +159,7 @@ const server = http.createServer(async (req, res) => {
       const reply = (data.content || [])
         .filter(b => b.type === 'text')
         .map(b => b.text)
-        .join('\n')
-        .trim();
+        .join('\n').trim();
 
       return sendJSON(res, 200, { reply });
 
