@@ -128,7 +128,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const payload = JSON.stringify({
-        model: 'claude-sonnet-4-5',
+        model: 'claude-haiku-4-5',
         max_tokens: 1000,
         system: `Você é um assistente de RH da empresa. O colaborador logado é: ${user.name}.
 
