@@ -3,9 +3,10 @@ const https = require('https');
 
 const USERS = JSON.parse(process.env.USERS || '{}');
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const NOTION_TOKEN = process.env.NOTION_TOKEN || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 const PORT = process.env.PORT || 8080;
+const GITHUB_REPO = process.env.GITHUB_REPO || 'rp-azevedo/rh-wiki';
+const WIKI_PATH = process.env.WIKI_PATH || 'Wiki da Azevedo Tintas';
 
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', FRONTEND_URL);
@@ -29,6 +30,129 @@ async function readBody(req) {
   });
 }
 
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    const options = new URL(url);
+    const req = https.request({
+      hostname: options.hostname,
+      path: options.pathname + options.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'rh-assistant',
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function getWikiFiles() {
+  try {
+    const url = `https://api.github.com/repos/${GITHUB_REPO}/git/trees/main?recursive=1`;
+    const tree = await httpsGet(url);
+    return (tree.tree || [])
+      .filter(f => f.path.endsWith('.md') && f.path.startsWith(WIKI_PATH))
+      .map(f => ({ path: f.path, url: f.url }));
+  } catch (e) {
+    console.error('Erro ao listar arquivos:', e.message);
+    return [];
+  }
+}
+
+async function getFileContent(filePath) {
+  try {
+    const encoded = filePath.split('/').map(p => encodeURIComponent(p)).join('/');
+    const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/${encoded}`;
+    return await new Promise((resolve, reject) => {
+      https.get(url, { headers: { 'User-Agent': 'rh-assistant' } }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => resolve(data));
+      }).on('error', reject);
+    });
+  } catch (e) {
+    return '';
+  }
+}
+
+function extrairLinks(conteudo) {
+  const matches = conteudo.match(/\[\[([^\]]+)\]\]/g) || [];
+  return matches.map(m => m.replace(/\[\[|\]\]/g, '').trim());
+}
+
+function calcularRelevancia(conteudo, query) {
+  const palavras = query.toLowerCase().split(/\s+/).filter(p => p.length > 2);
+  const texto = conteudo.toLowerCase();
+  let score = 0;
+  for (const palavra of palavras) {
+    const ocorrencias = (texto.match(new RegExp(palavra, 'g')) || []).length;
+    score += ocorrencias;
+  }
+  return score;
+}
+
+async function buscarContexto(query) {
+  const arquivos = await getWikiFiles();
+  if (arquivos.length === 0) return '(nenhum documento encontrado no wiki)';
+
+  const resultados = [];
+
+  for (const arquivo of arquivos) {
+    const conteudo = await getFileContent(arquivo.path);
+    if (!conteudo) continue;
+    const score = calcularRelevancia(conteudo, query);
+    const nome = arquivo.path.split('/').pop().replace('.md', '');
+    resultados.push({ nome, conteudo, score, path: arquivo.path });
+  }
+
+  // Ordena por relevância
+  resultados.sort((a, b) => b.score - a.score);
+
+  // Pega os 3 mais relevantes
+  const principais = resultados.slice(0, 3).filter(r => r.score > 0);
+
+  if (principais.length === 0) {
+    // Se não achou nada relevante, pega os 2 primeiros mesmo assim
+    principais.push(...resultados.slice(0, 2));
+  }
+
+  // Segue links cruzados dos principais
+  const nomesIncluidos = new Set(principais.map(r => r.nome));
+  const extras = [];
+
+  for (const principal of principais) {
+    const links = extrairLinks(principal.conteudo);
+    for (const link of links) {
+      if (!nomesIncluidos.has(link)) {
+        const encontrado = resultados.find(r => r.nome === link);
+        if (encontrado) {
+          extras.push(encontrado);
+          nomesIncluidos.add(link);
+        }
+      }
+    }
+  }
+
+  // Monta o contexto final
+  const todos = [...principais, ...extras.slice(0, 2)];
+  let contexto = '';
+  for (const r of todos) {
+    // Limita cada documento a 2000 caracteres para não estourar o contexto
+    const texto = r.conteudo.substring(0, 2000);
+    contexto += `\n\n=== ${r.nome} ===\n${texto}`;
+  }
+
+  return contexto || '(nenhuma informação relevante encontrada)';
+}
+
 function httpsRequest(options, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
@@ -36,56 +160,13 @@ function httpsRequest(options, body) {
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('Resposta inválida: ' + data.substring(0, 200))); }
+        catch (e) { reject(new Error('Resposta inválida')); }
       });
     });
     req.on('error', reject);
     if (body) req.write(body);
     req.end();
   });
-}
-
-async function searchNotion(query) {
-  const body = JSON.stringify({ query, page_size: 5 });
-  const res = await httpsRequest({
-    hostname: 'api.notion.com',
-    path: '/v1/search',
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${NOTION_TOKEN}`,
-      'Notion-Version': '2022-06-28',
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body)
-    }
-  }, body);
-  return res.results || [];
-}
-
-async function getPageContent(pageId) {
-  const res = await httpsRequest({
-    hostname: 'api.notion.com',
-    path: `/v1/blocks/${pageId}/children?page_size=100`,
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${NOTION_TOKEN}`,
-      'Notion-Version': '2022-06-28'
-    }
-  });
-  return (res.results || []).map(block => {
-    const type = block.type;
-    const rich = block[type]?.rich_text || [];
-    return rich.map(r => r.plain_text).join('');
-  }).filter(Boolean).join('\n');
-}
-
-function getPageTitle(page) {
-  const props = page.properties || {};
-  for (const key in props) {
-    if (props[key].type === 'title') {
-      return props[key].title.map(t => t.plain_text).join('');
-    }
-  }
-  return 'Sem título';
 }
 
 const server = http.createServer(async (req, res) => {
@@ -114,28 +195,18 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const lastMessage = body.messages[body.messages.length - 1].content;
-
-      const searchResults = await searchNotion(lastMessage);
-      let context = '';
-      for (const page of searchResults.slice(0, 3)) {
-        if (page.object !== 'page') continue;
-        const title = getPageTitle(page);
-        try {
-          const content = await getPageContent(page.id);
-          context += `\n\n=== ${title} ===\n${content}`;
-        } catch (e) {}
-      }
+      const ultimaMensagem = body.messages[body.messages.length - 1].content;
+      const contexto = await buscarContexto(ultimaMensagem);
 
       const payload = JSON.stringify({
         model: 'claude-haiku-4-5',
         max_tokens: 1000,
-        system: `Você é um assistente de RH da empresa. O colaborador logado é: ${user.name}.
+        system: `Você é um assistente de RH da Azevedo Tintas. O colaborador logado é: ${user.name}.
 
 Responda dúvidas usando APENAS as informações do wiki abaixo. Seja simpático, claro e objetivo. Use linguagem informal mas profissional. Se a informação não estiver no wiki, diga que vai verificar e sugira contato com o RH. Responda sempre em português brasileiro.
 
 WIKI DA EMPRESA:
-${context || '(nenhuma informação encontrada para essa pergunta)'}`,
+${contexto}`,
         messages: body.messages
       });
 
