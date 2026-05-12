@@ -68,8 +68,9 @@ Responda sempre em português brasileiro.`,
       .trim();
 
     res.json({ reply });
-  } catch (err) {
-    res.status(500).json({ error: 'Erro interno do servidor.' });
+ } catch (err) {
+    console.error('ERRO CHAT:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
   }
 });
 
