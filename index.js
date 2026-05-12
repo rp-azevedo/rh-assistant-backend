@@ -60,7 +60,7 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const payload = JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 1000,
         system: `Você é um assistente de RH da empresa. O colaborador logado é: ${user.name}. Responda dúvidas sobre regras, direitos, deveres, benefícios e informações institucionais com base no wiki da empresa no Notion (conectado via MCP). Seja simpático, claro e objetivo. Use linguagem informal mas profissional. Se não encontrar a informação no Notion, diga que vai verificar e sugira contato com o RH. Responda sempre em português brasileiro.`,
         messages: body.messages,
