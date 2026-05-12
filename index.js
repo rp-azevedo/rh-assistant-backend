@@ -68,7 +68,7 @@ const server = http.createServer(async (req, res) => {
           type: 'url',
           url: 'https://mcp.notion.com/mcp',
           name: 'notion-mcp',
-          authorization_token: NOTION_TOKEN
+          authorization_token: process.env.NOTION_TOKEN
         }]
       });
 
