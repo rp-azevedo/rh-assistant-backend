@@ -6,9 +6,8 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 const PORT = process.env.PORT || 8080;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'rp-azevedo/rh-wiki';
-const WIKI_PATH = process.env.WIKI_PATH || 'Wiki da Azevedo Tintas';
+const WIKI_PATH = process.env.WIKI_PATH || '';
 
-// Cache do wiki em memória
 let wikiCache = [];
 let cacheCarregado = false;
 
@@ -34,14 +33,14 @@ async function readBody(req) {
   });
 }
 
-function httpsGet(url, headers = {}) {
+function httpsGet(url) {
   return new Promise((resolve, reject) => {
     const options = new URL(url);
     https.request({
       hostname: options.hostname,
       path: options.pathname + options.search,
       method: 'GET',
-      headers: { 'User-Agent': 'rh-assistant', ...headers }
+      headers: { 'User-Agent': 'rh-assistant' }
     }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
@@ -58,9 +57,7 @@ async function carregarWiki() {
   try {
     const url = `https://api.github.com/repos/${GITHUB_REPO}/git/trees/main?recursive=1`;
     const tree = await httpsGet(url);
-    const arquivos = (tree.tree || []).filter(f =>
-      f.path.endsWith('.md') && f.path.startsWith(WIKI_PATH)
-    );
+    const arquivos = (tree.tree || []).filter(f => f.path.endsWith('.md'));
 
     console.log(`Encontrados ${arquivos.length} arquivos. Baixando...`);
     const docs = [];
@@ -81,10 +78,71 @@ async function carregarWiki() {
 
     wikiCache = docs;
     cacheCarregado = true;
-    console.log(`✅ Wiki carregado: ${docs.length} documentos em memória.`);
+    console.log(`Wiki carregado: ${docs.length} documentos.`);
   } catch (e) {
     console.error('Erro ao carregar wiki:', e.message);
   }
+}
+
+// Normaliza texto: remove acentos, pontuação, converte para minúsculas
+function normalizar(texto) {
+  return texto
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // remove acentos
+    .replace(/[^a-z0-9\s]/g, ' ')   // remove pontuação
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Expande termos comuns de RH para sinônimos
+function expandirTermos(query) {
+  const sinonimos = {
+    'ferias': ['ferias', 'descanso', 'folga', 'periodo aquisitivo', 'gozo'],
+    'folga': ['folga', 'ferias', 'descanso', 'falta'],
+    'falta': ['falta', 'ausencia', 'atestado', 'abono'],
+    'atestado': ['atestado', 'falta', 'medico', 'cid'],
+    'salario': ['salario', 'remuneracao', 'pagamento', 'holerite', 'adiantamento'],
+    'ponto': ['ponto', 'jornada', 'horario', 'controle', 'registro'],
+    'uniforme': ['uniforme', 'cracha', 'vestimenta'],
+    'demissao': ['demissao', 'justa causa', 'rescisao', 'desligamento'],
+    'beneficio': ['beneficio', 'convenio', 'odontologico', 'seguro', 'vale'],
+    'convenio': ['convenio', 'odontologico', 'plano', 'saude'],
+    'seguro': ['seguro', 'vida', 'beneficio'],
+    'transporte': ['transporte', 'vale transporte', 'vt'],
+    'banco de horas': ['banco de horas', 'horas extras', 'compensacao'],
+    'loja': ['loja', 'filial', 'unidade'],
+    'conduta': ['conduta', 'normas', 'comportamento', 'disciplina'],
+  };
+
+  const queryNorm = normalizar(query);
+  const termos = new Set(queryNorm.split(' ').filter(t => t.length > 2));
+
+  for (const [chave, expansao] of Object.entries(sinonimos)) {
+    if (queryNorm.includes(chave)) {
+      expansao.forEach(t => termos.add(t));
+    }
+  }
+
+  return [...termos];
+}
+
+function calcularRelevancia(doc, termos) {
+  const nomeNorm = normalizar(doc.nome);
+  const conteudoNorm = normalizar(doc.conteudo);
+  let score = 0;
+
+  for (const termo of termos) {
+    // Nome do arquivo tem peso maior
+    const ocNome = (nomeNorm.match(new RegExp(termo, 'g')) || []).length;
+    score += ocNome * 5;
+
+    // Conteúdo
+    const ocConteudo = (conteudoNorm.match(new RegExp(termo, 'g')) || []).length;
+    score += ocConteudo;
+  }
+
+  return score;
 }
 
 function extrairLinks(conteudo) {
@@ -92,27 +150,22 @@ function extrairLinks(conteudo) {
   return matches.map(m => m.replace(/\[\[|\]\]/g, '').trim());
 }
 
-function calcularRelevancia(conteudo, query) {
-  const palavras = query.toLowerCase().split(/\s+/).filter(p => p.length > 2);
-  const texto = conteudo.toLowerCase();
-  let score = 0;
-  for (const palavra of palavras) {
-    score += (texto.match(new RegExp(palavra, 'g')) || []).length;
-  }
-  return score;
-}
-
 function buscarContexto(query) {
-  if (wikiCache.length === 0) return '(wiki ainda carregando, tente novamente em instantes)';
+  if (wikiCache.length === 0) return '(wiki ainda carregando)';
 
-  const resultados = wikiCache.map(doc => ({
-    ...doc,
-    score: calcularRelevancia(doc.conteudo, query)
-  })).sort((a, b) => b.score - a.score);
+  const termos = expandirTermos(query);
 
-  const principais = resultados.slice(0, 3).filter(r => r.score > 0);
+  const resultados = wikiCache
+    .map(doc => ({ ...doc, score: calcularRelevancia(doc, termos) }))
+    .sort((a, b) => b.score - a.score);
+
+  // Pega os 3 mais relevantes com score > 0
+  const principais = resultados.filter(r => r.score > 0).slice(0, 3);
+
+  // Se não achou nada, pega os 2 primeiros mesmo assim
   if (principais.length === 0) principais.push(...resultados.slice(0, 2));
 
+  // Segue links cruzados
   const nomesIncluidos = new Set(principais.map(r => r.nome));
   const extras = [];
 
@@ -124,13 +177,18 @@ function buscarContexto(query) {
         if (encontrado) {
           extras.push(encontrado);
           nomesIncluidos.add(link);
+          if (extras.length >= 2) break;
         }
       }
     }
   }
 
-  const todos = [...principais, ...extras.slice(0, 2)];
-  return todos.map(r => `=== ${r.nome} ===\n${r.conteudo.substring(0, 2000)}`).join('\n\n');
+  const todos = [...principais, ...extras];
+  console.log(`Contexto: ${todos.map(r => r.nome).join(', ')}`);
+
+  return todos
+    .map(r => `=== ${r.nome} ===\n${r.conteudo.substring(0, 2500)}`)
+    .join('\n\n');
 }
 
 function httpsRequest(options, body) {
